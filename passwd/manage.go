@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -52,6 +53,10 @@ func AddUser(passwdPath, username, password string) error {
 	hash, err := HashPassword(password)
 	if err != nil {
 		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(passwdPath), 0o750); err != nil {
+		return fmt.Errorf("create domain directory: %w", err)
 	}
 
 	f, err := os.OpenFile(passwdPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o640)
