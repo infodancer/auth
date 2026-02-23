@@ -2,17 +2,21 @@
 //
 // Usage:
 //
-//	userctl add  <domain-dir> <username>   prompt for password and add user
-//	userctl del  <domain-dir> <username>   remove user
-//	userctl list <domain-dir>              list users and mailboxes
-//	userctl verify <domain-dir> <username> verify user password
+//	userctl [--domains <path>] add    <user@domain>   add user (prompts for password)
+//	userctl [--domains <path>] del    <user@domain>   remove user
+//	userctl [--domains <path>] list   <domain>        list users and mailboxes
+//	userctl [--domains <path>] verify <user@domain>   verify user password
+//
+// The domains path can also be set via the INFODANCER_DOMAINS_PATH environment variable.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 
 	"golang.org/x/term"
@@ -21,41 +25,55 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
+	fs := flag.NewFlagSet("userctl", flag.ExitOnError)
+	domainsPath := fs.String("domains", os.Getenv("INFODANCER_DOMAINS_PATH"), "path to domains directory")
+	fs.Usage = usage
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		os.Exit(1)
+	}
+
+	args := fs.Args()
+	if len(args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	subcmd := os.Args[1]
-	domainDir := os.Args[2]
-	passwdPath := filepath.Join(domainDir, "passwd")
+	if *domainsPath == "" {
+		fmt.Fprintln(os.Stderr, "error: --domains path required (or set INFODANCER_DOMAINS_PATH)")
+		os.Exit(1)
+	}
+
+	subcmd := args[0]
+	target := args[1]
 
 	var err error
 
 	switch subcmd {
 	case "add":
-		if len(os.Args) < 4 {
-			usage()
-			os.Exit(1)
+		var username, domainDir string
+		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		if err == nil {
+			err = cmdAdd(filepath.Join(domainDir, "passwd"), username)
 		}
-		err = cmdAdd(passwdPath, os.Args[3])
 
 	case "del":
-		if len(os.Args) < 4 {
-			usage()
-			os.Exit(1)
+		var username, domainDir string
+		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		if err == nil {
+			err = cmdDel(filepath.Join(domainDir, "passwd"), username)
 		}
-		err = cmdDel(passwdPath, os.Args[3])
 
 	case "list":
-		err = cmdList(passwdPath)
+		domainDir := filepath.Join(*domainsPath, target)
+		err = cmdList(filepath.Join(domainDir, "passwd"))
 
 	case "verify":
-		if len(os.Args) < 4 {
-			usage()
-			os.Exit(1)
+		var username, domainDir string
+		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		if err == nil {
+			err = cmdVerify(domainDir, username)
 		}
-		err = cmdVerify(domainDir, os.Args[3])
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n", subcmd)
@@ -67,6 +85,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// parseEmailTarget splits user@domain and returns the username and domain directory path.
+func parseEmailTarget(domainsPath, address string) (username, domainDir string, err error) {
+	parts := strings.SplitN(address, "@", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid address %q: expected user@domain", address)
+	}
+	return parts[0], filepath.Join(domainsPath, parts[1]), nil
 }
 
 func cmdAdd(passwdPath, username string) error {
@@ -160,9 +187,11 @@ func promptPassword(prompt string) (string, error) {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
-  userctl add    <domain-dir> <username>   add a new user (prompts for password)
-  userctl del    <domain-dir> <username>   remove a user
-  userctl list   <domain-dir>              list users and mailboxes
-  userctl verify <domain-dir> <username>   verify a user's password
+  userctl [--domains <path>] add    <user@domain>   add user (prompts for password)
+  userctl [--domains <path>] del    <user@domain>   remove user
+  userctl [--domains <path>] list   <domain>        list users and mailboxes
+  userctl [--domains <path>] verify <user@domain>   verify user password
+
+The domains path can also be set via INFODANCER_DOMAINS_PATH.
 `)
 }
