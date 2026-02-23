@@ -112,9 +112,13 @@ func cmdList(passwdPath string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "USERNAME\tMAILBOX")
+	if _, err := fmt.Fprintln(w, "USERNAME\tMAILBOX"); err != nil {
+		return err
+	}
 	for _, u := range users {
-		fmt.Fprintf(w, "%s\t%s\n", u.Username, u.Mailbox)
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", u.Username, u.Mailbox); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }
