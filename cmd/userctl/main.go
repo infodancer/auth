@@ -7,11 +7,15 @@
 //	userctl [--domains <path>] list   <domain>        list users and mailboxes
 //	userctl [--domains <path>] verify <user@domain>   verify user password
 //
-// The domains path can also be set via the INFODANCER_DOMAINS_PATH environment variable.
+// The domains path is resolved in order:
+//  1. --domains flag
+//  2. INFODANCER_DOMAINS_PATH environment variable
+//  3. smtpd.domains_path from /etc/infodancer/config.toml
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,14 +23,24 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/pelletier/go-toml/v2"
 	"golang.org/x/term"
 
 	"github.com/infodancer/auth/passwd"
 )
 
+const defaultConfigPath = "/etc/infodancer/config.toml"
+
+// serverConfig is a minimal view of the shared server config for path discovery.
+type serverConfig struct {
+	SMTPD struct {
+		DomainsPath string `toml:"domains_path"`
+	} `toml:"smtpd"`
+}
+
 func main() {
 	fs := flag.NewFlagSet("userctl", flag.ExitOnError)
-	domainsPath := fs.String("domains", os.Getenv("INFODANCER_DOMAINS_PATH"), "path to domains directory")
+	domainsFlag := fs.String("domains", "", "path to domains directory")
 	fs.Usage = usage
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -39,52 +53,87 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *domainsPath == "" {
-		fmt.Fprintln(os.Stderr, "error: --domains path required (or set INFODANCER_DOMAINS_PATH)")
+	domainsPath, err := resolveDomainsPath(*domainsFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	subcmd := args[0]
 	target := args[1]
 
-	var err error
-
 	switch subcmd {
 	case "add":
-		var username, domainDir string
-		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		username, domainDir, err := parseEmailTarget(domainsPath, target)
 		if err == nil {
 			err = cmdAdd(filepath.Join(domainDir, "passwd"), username)
 		}
+		exitOnErr(err)
 
 	case "del":
-		var username, domainDir string
-		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		username, domainDir, err := parseEmailTarget(domainsPath, target)
 		if err == nil {
 			err = cmdDel(filepath.Join(domainDir, "passwd"), username)
 		}
+		exitOnErr(err)
 
 	case "list":
-		domainDir := filepath.Join(*domainsPath, target)
-		err = cmdList(filepath.Join(domainDir, "passwd"))
+		domainDir := filepath.Join(domainsPath, target)
+		exitOnErr(cmdList(filepath.Join(domainDir, "passwd")))
 
 	case "verify":
-		var username, domainDir string
-		username, domainDir, err = parseEmailTarget(*domainsPath, target)
+		username, domainDir, err := parseEmailTarget(domainsPath, target)
 		if err == nil {
 			err = cmdVerify(domainDir, username)
 		}
+		exitOnErr(err)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n", subcmd)
 		usage()
 		os.Exit(1)
 	}
+}
 
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+// resolveDomainsPath returns the domains path using the precedence:
+// flag > env > /etc/infodancer/config.toml > error.
+func resolveDomainsPath(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
 	}
+
+	if v := os.Getenv("INFODANCER_DOMAINS_PATH"); v != "" {
+		return v, nil
+	}
+
+	path, err := domainsPathFromConfig(defaultConfigPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("domains path not set: use --domains, INFODANCER_DOMAINS_PATH, or ensure %s exists", defaultConfigPath)
+		}
+		return "", fmt.Errorf("read %s: %w", defaultConfigPath, err)
+	}
+
+	return path, nil
+}
+
+// domainsPathFromConfig reads smtpd.domains_path from the given config file.
+func domainsPathFromConfig(configPath string) (string, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", err
+	}
+
+	var cfg serverConfig
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		return "", fmt.Errorf("parse config: %w", err)
+	}
+
+	if cfg.SMTPD.DomainsPath == "" {
+		return "", fmt.Errorf("smtpd.domains_path not set in %s", configPath)
+	}
+
+	return cfg.SMTPD.DomainsPath, nil
 }
 
 // parseEmailTarget splits user@domain and returns the username and domain directory path.
@@ -185,6 +234,13 @@ func promptPassword(prompt string) (string, error) {
 	return string(raw), nil
 }
 
+func exitOnErr(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   userctl [--domains <path>] add    <user@domain>   add user (prompts for password)
@@ -192,6 +248,9 @@ func usage() {
   userctl [--domains <path>] list   <domain>        list users and mailboxes
   userctl [--domains <path>] verify <user@domain>   verify user password
 
-The domains path can also be set via INFODANCER_DOMAINS_PATH.
+Domains path resolution order:
+  1. --domains flag
+  2. INFODANCER_DOMAINS_PATH environment variable
+  3. smtpd.domains_path from /etc/infodancer/config.toml
 `)
 }
