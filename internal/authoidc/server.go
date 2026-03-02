@@ -2,8 +2,10 @@ package authoidc
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/infodancer/auth/domain"
 	"github.com/infodancer/auth/passwd"
@@ -11,10 +13,9 @@ import (
 
 // domainEntry holds the runtime state for a configured domain.
 type domainEntry struct {
-	name      string
-	isDefault bool // true when this is the DefaultDomain (root-path issuer)
-	agent     *passwd.Agent
-	clients   []ClientConfig
+	name    string
+	agent   *passwd.Agent
+	clients []ClientConfig
 }
 
 // Server is the auth-oidc HTTP server.
@@ -78,10 +79,9 @@ func (s *Server) loadDomain(name string) error {
 	}
 
 	s.domains[name] = &domainEntry{
-		name:      name,
-		isDefault: name == s.cfg.Server.DefaultDomain,
-		agent:     agent,
-		clients:   clients,
+		name:    name,
+		agent:   agent,
+		clients: clients,
 	}
 	return nil
 }
@@ -95,6 +95,9 @@ func (s *Server) Close() error {
 }
 
 // Handler returns the root HTTP handler with all routes registered.
+// Domain resolution is host-based: the Host header is matched against registered
+// domains by stripping labels from the left until a match is found.
+// For example, "auth.infodancer.net" resolves to the "infodancer.net" domain.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -102,68 +105,56 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	mux.HandleFunc("GET /{domain}/.well-known/openid-configuration", s.discovery)
-	mux.HandleFunc("GET /{domain}/.well-known/jwks.json", s.jwks)
-	mux.HandleFunc("GET /{domain}/authorize", s.authorize)
-	mux.HandleFunc("POST /{domain}/login", s.login)
-	mux.HandleFunc("POST /{domain}/token", s.token)
-	mux.HandleFunc("GET /{domain}/userinfo", s.userinfo)
-	mux.HandleFunc("POST /{domain}/logout", s.logout)
-
-	// When DefaultDomain is set, also serve all OIDC endpoints at the root
-	// path so that the issuer is scheme://host (RFC 8414 §5 — dedicated auth host).
-	if s.cfg.Server.DefaultDomain != "" {
-		if de, ok := s.domains[s.cfg.Server.DefaultDomain]; ok {
-			mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-				s.serveDiscovery(w, r, de)
-			})
-			mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
-				s.serveJWKS(w, r, de)
-			})
-			mux.HandleFunc("GET /authorize", func(w http.ResponseWriter, r *http.Request) {
-				s.serveAuthorize(w, r, de)
-			})
-			mux.HandleFunc("POST /login", func(w http.ResponseWriter, r *http.Request) {
-				s.serveLogin(w, r, de)
-			})
-			mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
-				s.serveToken(w, r, de)
-			})
-			mux.HandleFunc("GET /userinfo", func(w http.ResponseWriter, r *http.Request) {
-				s.serveUserinfo(w, r, de)
-			})
-			mux.HandleFunc("POST /logout", func(w http.ResponseWriter, r *http.Request) {
-				s.serveLogout(w, r, de)
-			})
-		}
-	}
+	mux.HandleFunc("GET /.well-known/openid-configuration", s.discovery)
+	mux.HandleFunc("GET /.well-known/jwks.json", s.jwks)
+	mux.HandleFunc("GET /authorize", s.authorize)
+	mux.HandleFunc("POST /login", s.login)
+	mux.HandleFunc("POST /token", s.token)
+	mux.HandleFunc("GET /userinfo", s.userinfo)
+	mux.HandleFunc("POST /logout", s.logout)
 
 	return mux
 }
 
-// issuerBase returns the OIDC issuer string for the given domain entry.
-// For the default domain (dedicated auth host), the issuer is scheme://host.
-// For all other domains it is scheme://host/domainName.
-func issuerBase(r *http.Request, de *domainEntry) string {
+// issuerBase returns the OIDC issuer string for the request.
+// Since routing is host-based, the issuer is always scheme://host.
+func issuerBase(r *http.Request) string {
 	scheme := "https"
 	if r.TLS == nil {
 		scheme = "http"
 	}
-	if de.isDefault {
-		return scheme + "://" + r.Host
-	}
-	return scheme + "://" + r.Host + "/" + de.name
+	return scheme + "://" + r.Host
 }
 
-// domainFor validates the domain path value and returns its entry.
-func (s *Server) domainFor(w http.ResponseWriter, r *http.Request) (*domainEntry, bool) {
-	name := r.PathValue("domain")
-	de, ok := s.domains[name]
-	if !ok {
-		http.Error(w, "unknown domain", http.StatusNotFound)
-		return nil, false
+// domainForHost resolves the domain entry by progressively stripping labels from
+// the left of the Host header until a registered domain is found or no candidates
+// remain. Stops before bare TLDs (single label with no dot).
+//
+// Examples:
+//
+//	"auth.infodancer.net" → tries "auth.infodancer.net", then "infodancer.net"
+//	"infodancer.net"      → tries "infodancer.net" directly
+func (s *Server) domainForHost(w http.ResponseWriter, r *http.Request) (*domainEntry, bool) {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
-	return de, true
+	candidate := host
+	for {
+		if de, ok := s.domains[candidate]; ok {
+			return de, true
+		}
+		dot := strings.IndexByte(candidate, '.')
+		if dot < 0 {
+			break // single label, nowhere left to go
+		}
+		candidate = candidate[dot+1:]
+		if !strings.Contains(candidate, ".") {
+			break // next strip would leave a bare TLD
+		}
+	}
+	http.Error(w, "unknown domain", http.StatusNotFound)
+	return nil, false
 }
 
 // clientFor finds a registered client by ID within a domain entry.

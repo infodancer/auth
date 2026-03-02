@@ -137,7 +137,7 @@ type tokenResponse struct {
 // --- discovery ---
 
 func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -145,7 +145,7 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDiscovery(w http.ResponseWriter, r *http.Request, de *domainEntry) {
-	base := issuerBase(r, de)
+	base := issuerBase(r)
 	doc := discoveryDoc{
 		Issuer:                            base,
 		AuthorizationEndpoint:             base + "/authorize",
@@ -166,7 +166,7 @@ func (s *Server) serveDiscovery(w http.ResponseWriter, r *http.Request, de *doma
 // --- jwks ---
 
 func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -192,7 +192,7 @@ func (s *Server) serveJWKS(w http.ResponseWriter, _ *http.Request, de *domainEnt
 // --- authorize ---
 
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -235,7 +235,7 @@ func (s *Server) serveAuthorize(w http.ResponseWriter, r *http.Request, de *doma
 // --- login ---
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -302,7 +302,7 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, de *domainEn
 // --- token ---
 
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -372,7 +372,7 @@ func (s *Server) serveToken(w http.ResponseWriter, r *http.Request, de *domainEn
 		return
 	}
 
-	issuer := issuerBase(r, de)
+	issuer := issuerBase(r)
 	email := c.Username + "@" + de.name
 	ttl := time.Duration(s.cfg.Server.JWTTTLSec) * time.Second
 
@@ -398,7 +398,7 @@ func (s *Server) serveToken(w http.ResponseWriter, r *http.Request, de *domainEn
 // --- userinfo ---
 
 func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -434,7 +434,7 @@ func (s *Server) serveUserinfo(w http.ResponseWriter, r *http.Request, de *domai
 	tok, err := jwt.Parse([]byte(rawToken),
 		jwt.WithKeySet(pubSet),
 		jwt.WithValidate(true),
-		jwt.WithIssuer(issuerBase(r, de)),
+		jwt.WithIssuer(issuerBase(r)),
 	)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
@@ -457,7 +457,7 @@ func (s *Server) serveUserinfo(w http.ResponseWriter, r *http.Request, de *domai
 // --- logout ---
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	de, ok := s.domainFor(w, r)
+	de, ok := s.domainForHost(w, r)
 	if !ok {
 		return
 	}
@@ -651,17 +651,13 @@ func bearerToken(r *http.Request) string {
 }
 
 func renderLoginForm(w http.ResponseWriter, de *domainEntry, params authorizeParams, username, errMsg, csrfToken string) {
-	loginAction := "/" + de.name + "/login"
-	if de.isDefault {
-		loginAction = "/login"
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if errMsg != "" {
 		w.WriteHeader(http.StatusUnauthorized)
 	}
 	_ = loginTmpl.Execute(w, loginFormData{
 		Domain:              de.name,
-		LoginAction:         loginAction,
+		LoginAction:         "/login",
 		ClientID:            params.ClientID,
 		RedirectURI:         params.RedirectURI,
 		Scope:               params.Scope,

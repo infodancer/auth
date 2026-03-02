@@ -18,13 +18,8 @@ type ServerConfig struct {
 	Listen         string `toml:"listen"`
 	DataDir        string `toml:"data_dir"`
 	DomainDataPath string `toml:"domain_data_path"`
-	JWTTTLSec      int64  `toml:"jwt_ttl_sec"`
-	SessionTTLSec  int64  `toml:"session_ttl_sec"`
-	// DefaultDomain, when set, additionally registers all OIDC endpoints at the
-	// root path (/.well-known/openid-configuration, /authorize, /token, etc.)
-	// with the issuer set to scheme://host (no path component). This is the
-	// correct RFC 8414 layout for a dedicated auth host.
-	DefaultDomain string `toml:"default_domain"`
+	JWTTTLSec     int64 `toml:"jwt_ttl_sec"`
+	SessionTTLSec int64 `toml:"session_ttl_sec"`
 }
 
 // ClientConfig describes a registered OIDC relying party.
