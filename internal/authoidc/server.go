@@ -11,9 +11,10 @@ import (
 
 // domainEntry holds the runtime state for a configured domain.
 type domainEntry struct {
-	name    string
-	agent   *passwd.Agent
-	clients []ClientConfig
+	name      string
+	isDefault bool // true when this is the DefaultDomain (root-path issuer)
+	agent     *passwd.Agent
+	clients   []ClientConfig
 }
 
 // Server is the auth-oidc HTTP server.
@@ -77,9 +78,10 @@ func (s *Server) loadDomain(name string) error {
 	}
 
 	s.domains[name] = &domainEntry{
-		name:    name,
-		agent:   agent,
-		clients: clients,
+		name:      name,
+		isDefault: name == s.cfg.Server.DefaultDomain,
+		agent:     agent,
+		clients:   clients,
 	}
 	return nil
 }
@@ -108,16 +110,49 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{domain}/userinfo", s.userinfo)
 	mux.HandleFunc("POST /{domain}/logout", s.logout)
 
+	// When DefaultDomain is set, also serve all OIDC endpoints at the root
+	// path so that the issuer is scheme://host (RFC 8414 §5 — dedicated auth host).
+	if s.cfg.Server.DefaultDomain != "" {
+		if de, ok := s.domains[s.cfg.Server.DefaultDomain]; ok {
+			mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+				s.serveDiscovery(w, r, de)
+			})
+			mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+				s.serveJWKS(w, r, de)
+			})
+			mux.HandleFunc("GET /authorize", func(w http.ResponseWriter, r *http.Request) {
+				s.serveAuthorize(w, r, de)
+			})
+			mux.HandleFunc("POST /login", func(w http.ResponseWriter, r *http.Request) {
+				s.serveLogin(w, r, de)
+			})
+			mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
+				s.serveToken(w, r, de)
+			})
+			mux.HandleFunc("GET /userinfo", func(w http.ResponseWriter, r *http.Request) {
+				s.serveUserinfo(w, r, de)
+			})
+			mux.HandleFunc("POST /logout", func(w http.ResponseWriter, r *http.Request) {
+				s.serveLogout(w, r, de)
+			})
+		}
+	}
+
 	return mux
 }
 
-// issuerBase returns the OIDC issuer string for the given domain.
-func issuerBase(r *http.Request, domainName string) string {
+// issuerBase returns the OIDC issuer string for the given domain entry.
+// For the default domain (dedicated auth host), the issuer is scheme://host.
+// For all other domains it is scheme://host/domainName.
+func issuerBase(r *http.Request, de *domainEntry) string {
 	scheme := "https"
 	if r.TLS == nil {
 		scheme = "http"
 	}
-	return scheme + "://" + r.Host + "/" + domainName
+	if de.isDefault {
+		return scheme + "://" + r.Host
+	}
+	return scheme + "://" + r.Host + "/" + de.name
 }
 
 // domainFor validates the domain path value and returns its entry.

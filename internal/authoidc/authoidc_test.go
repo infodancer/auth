@@ -90,6 +90,146 @@ func authorizeURL(state, challenge string) string {
 	return "/test.example/authorize?" + q.Encode()
 }
 
+// newDefaultDomainServer creates a Server with DefaultDomain set to "test.example",
+// so OIDC endpoints are also served at the root path.
+func newDefaultDomainServer(t *testing.T) http.Handler {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	dataDir := filepath.Join(tmpDir, "data")
+	domainDir := filepath.Join(tmpDir, "domains", "test.example")
+	keyDir := filepath.Join(domainDir, "keys")
+
+	for _, d := range []string{dataDir, domainDir, keyDir} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+
+	domainCfg := "[auth]\ntype = \"passwd\"\ncredential_backend = \"passwd\"\nkey_backend = \"keys\"\n"
+	if err := os.WriteFile(filepath.Join(domainDir, "config.toml"), []byte(domainCfg), 0600); err != nil {
+		t.Fatalf("write domain config: %v", err)
+	}
+
+	passwdPath := filepath.Join(domainDir, "passwd")
+	if err := passwd.AddUser(passwdPath, "alice", "s3cr3t"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+
+	cfg := &authoidc.Config{
+		Server: authoidc.ServerConfig{
+			Listen:         ":0",
+			DataDir:        dataDir,
+			DomainDataPath: filepath.Join(tmpDir, "domains"),
+			JWTTTLSec:      3600,
+			SessionTTLSec:  604800,
+			DefaultDomain:  "test.example",
+		},
+		Clients: []authoidc.ClientConfig{
+			{
+				Domain:       "test.example",
+				ID:           "testclient",
+				RedirectURIs: []string{"https://app.example/callback"},
+			},
+		},
+	}
+
+	srv, err := authoidc.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv.Handler()
+}
+
+func TestDiscovery_DefaultDomain(t *testing.T) {
+	handler := newDefaultDomainServer(t)
+
+	// Root path discovery should use scheme://host as the issuer (RFC 8414).
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
+	req.Host = "auth.infodancer.net"
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var doc map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc["issuer"] != "http://auth.infodancer.net" {
+		t.Errorf("issuer = %v, want http://auth.infodancer.net", doc["issuer"])
+	}
+	// Authorization endpoint should be at the root path too.
+	if doc["authorization_endpoint"] != "http://auth.infodancer.net/authorize" {
+		t.Errorf("authorization_endpoint = %v", doc["authorization_endpoint"])
+	}
+}
+
+func TestFullLoginFlow_DefaultDomain(t *testing.T) {
+	handler := newDefaultDomainServer(t)
+	verifier, challenge := pkceParams()
+
+	// Authorize at root path.
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", "testclient")
+	q.Set("redirect_uri", "https://app.example/callback")
+	q.Set("scope", "openid email")
+	q.Set("state", "st")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+
+	csrfToken, csrfCookie := getCSRF(t, handler, "/authorize?"+q.Encode())
+
+	// Login at root path.
+	form := url.Values{}
+	form.Set("csrf_token", csrfToken)
+	form.Set("client_id", "testclient")
+	form.Set("redirect_uri", "https://app.example/callback")
+	form.Set("scope", "openid email")
+	form.Set("state", "st")
+	form.Set("code_challenge", challenge)
+	form.Set("code_challenge_method", "S256")
+	form.Set("username", "alice")
+	form.Set("password", "s3cr3t")
+
+	loginRR := doRequest(handler, http.MethodPost, "/login",
+		strings.NewReader(form.Encode()), []*http.Cookie{csrfCookie})
+	if loginRR.Code != http.StatusFound {
+		t.Fatalf("login = %d; body: %s", loginRR.Code, loginRR.Body)
+	}
+
+	loc := loginRR.Header().Get("Location")
+	u, _ := url.Parse(loc)
+	code := u.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in redirect: %s", loc)
+	}
+
+	// Token exchange at root path.
+	tf := url.Values{}
+	tf.Set("grant_type", "authorization_code")
+	tf.Set("code", code)
+	tf.Set("redirect_uri", "https://app.example/callback")
+	tf.Set("client_id", "testclient")
+	tf.Set("code_verifier", verifier)
+	rr := doRequest(handler, http.MethodPost, "/token",
+		strings.NewReader(tf.Encode()), nil)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("token = %d; body: %s", rr.Code, rr.Body)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if at, _ := resp["access_token"].(string); at == "" {
+		t.Error("missing access_token")
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	handler := newTestServer(t)
 	rr := doRequest(handler, http.MethodGet, "/healthz", nil, nil)

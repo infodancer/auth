@@ -39,7 +39,7 @@ var loginTmpl = template.Must(template.New("login").Parse(`<!DOCTYPE html>
   <article>
     <header><h2>Sign in to {{.Domain}}</h2></header>
     {{if .Error}}<p style="color:var(--pico-color-red-500)">{{.Error}}</p>{{end}}
-    <form method="POST" action="/{{.Domain}}/login">
+    <form method="POST" action="{{.LoginAction}}">
       <input type="hidden" name="csrf_token"            value="{{.CSRFToken}}">
       <input type="hidden" name="client_id"             value="{{.ClientID}}">
       <input type="hidden" name="redirect_uri"          value="{{.RedirectURI}}">
@@ -82,6 +82,7 @@ var errorTmpl = template.Must(template.New("error").Parse(`<!DOCTYPE html>
 
 type loginFormData struct {
 	Domain              string
+	LoginAction         string // form POST action URL
 	ClientID            string
 	RedirectURI         string
 	Scope               string
@@ -140,7 +141,11 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	base := issuerBase(r, de.name)
+	s.serveDiscovery(w, r, de)
+}
+
+func (s *Server) serveDiscovery(w http.ResponseWriter, r *http.Request, de *domainEntry) {
+	base := issuerBase(r, de)
 	doc := discoveryDoc{
 		Issuer:                            base,
 		AuthorizationEndpoint:             base + "/authorize",
@@ -165,6 +170,10 @@ func (s *Server) jwks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveJWKS(w, r, de)
+}
+
+func (s *Server) serveJWKS(w http.ResponseWriter, _ *http.Request, de *domainEntry) {
 	dk, ok := s.keys.Get(de.name)
 	if !ok {
 		http.Error(w, "no key for domain", http.StatusInternalServerError)
@@ -187,6 +196,10 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveAuthorize(w, r, de)
+}
+
+func (s *Server) serveAuthorize(w http.ResponseWriter, r *http.Request, de *domainEntry) {
 	q := r.URL.Query()
 	params := authorizeParams{
 		ClientID:            q.Get("client_id"),
@@ -216,7 +229,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	csrfToken := getOrSetCSRF(w, r)
-	renderLoginForm(w, de.name, params, "", "", csrfToken)
+	renderLoginForm(w, de, params, "", "", csrfToken)
 }
 
 // --- login ---
@@ -226,6 +239,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveLogin(w, r, de)
+}
+
+func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, de *domainEntry) {
 	if err := r.ParseForm(); err != nil {
 		renderError(w, http.StatusBadRequest, "Bad Request", "invalid form data")
 		return
@@ -255,16 +272,16 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 
 	localpart, err := normalizeLocalpart(rawUsername, de.name)
 	if err != nil {
-		renderLoginForm(w, de.name, params, rawUsername, "Invalid email or username.", csrfToken)
+		renderLoginForm(w, de, params, rawUsername, "Invalid email or username.", csrfToken)
 		return
 	}
 
 	_, authErr := de.agent.Authenticate(r.Context(), localpart, password)
 	if authErr != nil {
 		if errors.Is(authErr, autherrors.ErrUserNotFound) || errors.Is(authErr, autherrors.ErrAuthFailed) {
-			renderLoginForm(w, de.name, params, rawUsername, "Invalid username or password.", csrfToken)
+			renderLoginForm(w, de, params, rawUsername, "Invalid username or password.", csrfToken)
 		} else {
-			renderLoginForm(w, de.name, params, rawUsername, "An error occurred. Please try again.", csrfToken)
+			renderLoginForm(w, de, params, rawUsername, "An error occurred. Please try again.", csrfToken)
 		}
 		return
 	}
@@ -289,6 +306,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveToken(w, r, de)
+}
+
+func (s *Server) serveToken(w http.ResponseWriter, r *http.Request, de *domainEntry) {
 	if err := r.ParseForm(); err != nil {
 		respondJSONError(w, http.StatusBadRequest, "invalid_request", "cannot parse form")
 		return
@@ -351,7 +372,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issuer := issuerBase(r, de.name)
+	issuer := issuerBase(r, de)
 	email := c.Username + "@" + de.name
 	ttl := time.Duration(s.cfg.Server.JWTTTLSec) * time.Second
 
@@ -381,7 +402,10 @@ func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.serveUserinfo(w, r, de)
+}
 
+func (s *Server) serveUserinfo(w http.ResponseWriter, r *http.Request, de *domainEntry) {
 	rawToken := bearerToken(r)
 	if rawToken == "" {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="auth-oidc"`)
@@ -410,7 +434,7 @@ func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
 	tok, err := jwt.Parse([]byte(rawToken),
 		jwt.WithKeySet(pubSet),
 		jwt.WithValidate(true),
-		jwt.WithIssuer(issuerBase(r, de.name)),
+		jwt.WithIssuer(issuerBase(r, de)),
 	)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
@@ -433,6 +457,14 @@ func (s *Server) userinfo(w http.ResponseWriter, r *http.Request) {
 // --- logout ---
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	de, ok := s.domainFor(w, r)
+	if !ok {
+		return
+	}
+	s.serveLogout(w, r, de)
+}
+
+func (s *Server) serveLogout(w http.ResponseWriter, r *http.Request, _ *domainEntry) {
 	if sessID := sessionCookie(r); sessID != "" {
 		s.store.DeleteSession(sessID)
 	}
@@ -618,13 +650,18 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-func renderLoginForm(w http.ResponseWriter, domainName string, params authorizeParams, username, errMsg, csrfToken string) {
+func renderLoginForm(w http.ResponseWriter, de *domainEntry, params authorizeParams, username, errMsg, csrfToken string) {
+	loginAction := "/" + de.name + "/login"
+	if de.isDefault {
+		loginAction = "/login"
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if errMsg != "" {
 		w.WriteHeader(http.StatusUnauthorized)
 	}
 	_ = loginTmpl.Execute(w, loginFormData{
-		Domain:              domainName,
+		Domain:              de.name,
+		LoginAction:         loginAction,
 		ClientID:            params.ClientID,
 		RedirectURI:         params.RedirectURI,
 		Scope:               params.Scope,
