@@ -180,14 +180,14 @@ func (s *Server) clientFor(de *domainEntry, clientID string) (*ClientConfig, boo
 
 // validateRedirectURIScheme returns an error if rawURI is not a valid redirect
 // URI for RFC 7591 dynamic client registration. HTTPS is required except for
-// localhost/127.0.0.1, which are allowed for local development.
+// localhost/127.0.0.1/[::1], which are allowed for local development.
 func validateRedirectURIScheme(rawURI string) error {
 	u, err := url.Parse(rawURI)
 	if err != nil || u.Host == "" {
 		return fmt.Errorf("invalid redirect_uri: %q", rawURI)
 	}
-	host := u.Hostname()
-	if host == "localhost" || host == "127.0.0.1" {
+	host := u.Hostname() // strips port and brackets from IPv6
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return nil
 	}
 	if u.Scheme != "https" {

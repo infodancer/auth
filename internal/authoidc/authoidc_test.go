@@ -401,6 +401,34 @@ func TestRegister_LocalhostHTTP(t *testing.T) {
 	}
 }
 
+// TestRegister_NotIdempotent verifies that two registrations with identical payloads
+// produce different client_ids, since IDs are now randomly generated (not HMAC-derived).
+func TestRegister_NotIdempotent(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"client_name":"myapp","redirect_uris":["https://app.test.example/cb"]}`
+	rr1 := doRegisterRequest(handler, body)
+	rr2 := doRegisterRequest(handler, body)
+	if rr1.Code != http.StatusCreated || rr2.Code != http.StatusCreated {
+		t.Fatalf("register status: %d, %d", rr1.Code, rr2.Code)
+	}
+	var r1, r2 map[string]any
+	_ = json.NewDecoder(rr1.Body).Decode(&r1)
+	_ = json.NewDecoder(rr2.Body).Decode(&r2)
+	if r1["client_id"] == r2["client_id"] {
+		t.Errorf("expected different client_ids for repeated registration, got same: %v", r1["client_id"])
+	}
+}
+
+// TestRegister_IPv6LoopbackHTTP verifies that http://[::1] is accepted for local dev.
+func TestRegister_IPv6LoopbackHTTP(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"redirect_uris":["http://[::1]:8080/cb"]}`
+	rr := doRegisterRequest(handler, body)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("IPv6 loopback HTTP URI: got %d, want 201; body: %s", rr.Code, rr.Body)
+	}
+}
+
 func TestDiscovery_RegistrationEndpoint(t *testing.T) {
 	handler := newTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
