@@ -54,7 +54,7 @@ func cmdServe() {
 		fmt.Fprintf(os.Stderr, "server init: %v\n", err)
 		os.Exit(1)
 	}
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	fmt.Printf("auth-oidc %s listening on %s\n", version, cfg.Server.Listen)
 	if err := http.ListenAndServe(cfg.Server.Listen, srv.Handler()); err != nil {
