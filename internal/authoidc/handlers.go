@@ -2,6 +2,7 @@ package authoidc
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -528,7 +529,13 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, de *domai
 		responseTypes = []string{"code"}
 	}
 
-	clientID := generateToken(16)
+	// Derive a stable, deterministic client_id so re-registration after a
+	// server restart yields the same value. The HMAC key is the registration
+	// token, so only callers who know the token can predict the client_id.
+	mac := hmac.New(sha256.New, []byte(s.cfg.Server.RegistrationToken))
+	mac.Write([]byte(de.name + "\x00" + req.ClientName))
+	clientID := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
 	now := time.Now()
 	s.store.RegisterClient(&registeredClient{
 		ClientID:     clientID,

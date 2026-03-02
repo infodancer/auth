@@ -387,6 +387,22 @@ func TestRegister_BadToken(t *testing.T) {
 	}
 }
 
+func TestRegister_Idempotent(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"client_name":"myapp","redirect_uris":["https://app.test.example/cb"]}`
+	rr1 := doRegisterRequest(handler, "test-reg-token", body)
+	rr2 := doRegisterRequest(handler, "test-reg-token", body)
+	if rr1.Code != http.StatusCreated || rr2.Code != http.StatusCreated {
+		t.Fatalf("register status: %d, %d", rr1.Code, rr2.Code)
+	}
+	var r1, r2 map[string]any
+	_ = json.NewDecoder(rr1.Body).Decode(&r1)
+	_ = json.NewDecoder(rr2.Body).Decode(&r2)
+	if r1["client_id"] != r2["client_id"] {
+		t.Errorf("client_id not stable across registrations: %v != %v", r1["client_id"], r2["client_id"])
+	}
+}
+
 func TestRegister_UntrustedDomain(t *testing.T) {
 	handler := newTestServer(t)
 	body := `{"redirect_uris":["https://attacker.example.com/steal"]}`
