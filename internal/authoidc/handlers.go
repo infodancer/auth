@@ -125,6 +125,27 @@ type discoveryDoc struct {
 	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
 	ClaimsSupported                   []string `json:"claims_supported"`
 	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported"`
+	RegistrationEndpoint              string   `json:"registration_endpoint,omitempty"`
+}
+
+// registrationRequest is the RFC 7591 client registration request body.
+type registrationRequest struct {
+	ClientName              string   `json:"client_name"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	GrantTypes              []string `json:"grant_types"`
+	ResponseTypes           []string `json:"response_types"`
+}
+
+// registrationResponse is the RFC 7591 client registration response body.
+type registrationResponse struct {
+	ClientID                string   `json:"client_id"`
+	ClientIDIssuedAt        int64    `json:"client_id_issued_at"`
+	ClientName              string   `json:"client_name"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	GrantTypes              []string `json:"grant_types"`
+	ResponseTypes           []string `json:"response_types"`
 }
 
 type tokenResponse struct {
@@ -159,6 +180,9 @@ func (s *Server) serveDiscovery(w http.ResponseWriter, r *http.Request, de *doma
 		TokenEndpointAuthMethodsSupported: []string{"none", "client_secret_post"},
 		ClaimsSupported:                   []string{"sub", "email", "name", "iss", "aud", "exp", "iat"},
 		CodeChallengeMethodsSupported:     []string{"S256"},
+	}
+	if s.cfg.Server.RegistrationToken != "" {
+		doc.RegistrationEndpoint = base + "/register"
 	}
 	respondJSON(w, http.StatusOK, doc)
 }
@@ -452,6 +476,77 @@ func (s *Server) serveUserinfo(w http.ResponseWriter, r *http.Request, de *domai
 		claims["name"] = name
 	}
 	respondJSON(w, http.StatusOK, claims)
+}
+
+// --- register (RFC 7591) ---
+
+func (s *Server) register(w http.ResponseWriter, r *http.Request) {
+	de, ok := s.domainForHost(w, r)
+	if !ok {
+		return
+	}
+	s.serveRegister(w, r, de)
+}
+
+func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, de *domainEntry) {
+	if s.cfg.Server.RegistrationToken == "" {
+		http.Error(w, "dynamic client registration is not enabled", http.StatusNotImplemented)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(bearerToken(r)), []byte(s.cfg.Server.RegistrationToken)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="auth-oidc-registration"`)
+		http.Error(w, "invalid or missing registration token", http.StatusUnauthorized)
+		return
+	}
+
+	var req registrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSONError(w, http.StatusBadRequest, "invalid_client_metadata", "invalid JSON body")
+		return
+	}
+	if len(req.RedirectURIs) == 0 {
+		respondJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uris is required")
+		return
+	}
+	for _, uri := range req.RedirectURIs {
+		if err := s.validateRedirectURIDomain(uri); err != nil {
+			respondJSONError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
+			return
+		}
+	}
+
+	authMeth := req.TokenEndpointAuthMethod
+	if authMeth == "" {
+		authMeth = "none"
+	}
+	grantTypes := req.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code"}
+	}
+	responseTypes := req.ResponseTypes
+	if len(responseTypes) == 0 {
+		responseTypes = []string{"code"}
+	}
+
+	clientID := generateToken(16)
+	now := time.Now()
+	s.store.RegisterClient(&registeredClient{
+		ClientID:     clientID,
+		Domain:       de.name,
+		ClientName:   req.ClientName,
+		RedirectURIs: req.RedirectURIs,
+		RegisteredAt: now,
+	})
+
+	respondJSON(w, http.StatusCreated, registrationResponse{
+		ClientID:                clientID,
+		ClientIDIssuedAt:        now.Unix(),
+		ClientName:              req.ClientName,
+		RedirectURIs:            req.RedirectURIs,
+		TokenEndpointAuthMethod: authMeth,
+		GrantTypes:              grantTypes,
+		ResponseTypes:           responseTypes,
+	})
 }
 
 // --- logout ---

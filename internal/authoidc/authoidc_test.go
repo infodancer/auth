@@ -48,11 +48,12 @@ func newTestServer(t *testing.T) http.Handler {
 
 	cfg := &authoidc.Config{
 		Server: authoidc.ServerConfig{
-			Listen:         ":0",
-			DataDir:        dataDir,
-			DomainDataPath: filepath.Join(tmpDir, "domains"),
-			JWTTTLSec:      3600,
-			SessionTTLSec:  604800,
+			Listen:            ":0",
+			DataDir:           dataDir,
+			DomainDataPath:    filepath.Join(tmpDir, "domains"),
+			JWTTTLSec:         3600,
+			SessionTTLSec:     604800,
+			RegistrationToken: "test-reg-token",
 		},
 		Clients: []authoidc.ClientConfig{
 			{
@@ -347,6 +348,146 @@ func TestLogout(t *testing.T) {
 	}
 }
 
+// --- RFC 7591 dynamic client registration ---
+
+func TestRegister_Success(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"client_name":"myapp","redirect_uris":["https://app.test.example/cb"]}`
+	rr := doRegisterRequest(handler, "test-reg-token", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("register = %d; body: %s", rr.Code, rr.Body)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["client_id"] == "" {
+		t.Error("expected non-empty client_id")
+	}
+	if resp["client_id_issued_at"] == nil {
+		t.Error("expected client_id_issued_at")
+	}
+}
+
+func TestRegister_NoToken(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"redirect_uris":["https://app.test.example/cb"]}`
+	rr := doRegisterRequest(handler, "", body)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("no token: got %d, want 401", rr.Code)
+	}
+}
+
+func TestRegister_BadToken(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"redirect_uris":["https://app.test.example/cb"]}`
+	rr := doRegisterRequest(handler, "wrong-token", body)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("bad token: got %d, want 401", rr.Code)
+	}
+}
+
+func TestRegister_UntrustedDomain(t *testing.T) {
+	handler := newTestServer(t)
+	body := `{"redirect_uris":["https://attacker.example.com/steal"]}`
+	rr := doRegisterRequest(handler, "test-reg-token", body)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("untrusted domain: got %d, want 400", rr.Code)
+	}
+}
+
+func TestDiscovery_RegistrationEndpoint(t *testing.T) {
+	handler := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
+	req.Host = testHost
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	var doc map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ep, _ := doc["registration_endpoint"].(string)
+	if ep == "" {
+		t.Error("expected registration_endpoint in discovery doc")
+	}
+}
+
+func TestFullLoginFlow_DynamicClient(t *testing.T) {
+	handler := newTestServer(t)
+
+	// Register a client dynamically.
+	regBody := `{"client_name":"dynapp","redirect_uris":["https://dynapp.test.example/callback"]}`
+	regRR := doRegisterRequest(handler, "test-reg-token", regBody)
+	if regRR.Code != http.StatusCreated {
+		t.Fatalf("register = %d; body: %s", regRR.Code, regRR.Body)
+	}
+	var regResp map[string]any
+	if err := json.NewDecoder(regRR.Body).Decode(&regResp); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+	clientID, _ := regResp["client_id"].(string)
+	if clientID == "" {
+		t.Fatal("no client_id in registration response")
+	}
+	redirectURI := "https://dynapp.test.example/callback"
+
+	verifier, challenge := pkceParams()
+
+	// Authorize.
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", clientID)
+	q.Set("redirect_uri", redirectURI)
+	q.Set("scope", "openid email")
+	q.Set("state", "st")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	csrfToken, csrfCookie := getCSRF(t, handler, "/authorize?"+q.Encode())
+
+	// Login.
+	form := url.Values{}
+	form.Set("csrf_token", csrfToken)
+	form.Set("client_id", clientID)
+	form.Set("redirect_uri", redirectURI)
+	form.Set("scope", "openid email")
+	form.Set("state", "st")
+	form.Set("code_challenge", challenge)
+	form.Set("code_challenge_method", "S256")
+	form.Set("username", "alice")
+	form.Set("password", "s3cr3t")
+	loginRR := doRequest(handler, http.MethodPost, "/login",
+		strings.NewReader(form.Encode()), []*http.Cookie{csrfCookie})
+	if loginRR.Code != http.StatusFound {
+		t.Fatalf("login = %d; body: %s", loginRR.Code, loginRR.Body)
+	}
+	loc := loginRR.Header().Get("Location")
+	u, _ := url.Parse(loc)
+	code := u.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in redirect: %s", loc)
+	}
+
+	// Token exchange.
+	tf := url.Values{}
+	tf.Set("grant_type", "authorization_code")
+	tf.Set("code", code)
+	tf.Set("redirect_uri", redirectURI)
+	tf.Set("client_id", clientID)
+	tf.Set("code_verifier", verifier)
+	rr := doRequest(handler, http.MethodPost, "/token",
+		strings.NewReader(tf.Encode()), nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("token = %d; body: %s", rr.Code, rr.Body)
+	}
+	var tokenResp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if at, _ := tokenResp["access_token"].(string); at == "" {
+		t.Error("missing access_token")
+	}
+}
+
 // --- flow helpers ---
 
 // fullLoginFlow runs a complete authorize → login → token exchange for alice.
@@ -425,6 +566,19 @@ func doLoginRaw(t *testing.T, handler http.Handler, csrfToken string, csrfCookie
 	form.Set("password", password)
 	return doRequest(handler, http.MethodPost, "/login",
 		strings.NewReader(form.Encode()), []*http.Cookie{csrfCookie})
+}
+
+// doRegisterRequest sends a POST /register with a JSON body and optional bearer token.
+func doRegisterRequest(handler http.Handler, token, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	return rr
 }
 
 func doRequest(handler http.Handler, method, target string, body *strings.Reader, cookies []*http.Cookie) *httptest.ResponseRecorder {

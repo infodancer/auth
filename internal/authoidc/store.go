@@ -35,6 +35,16 @@ type ssoSession struct {
 	ExpiresAt time.Time
 }
 
+// registeredClient holds metadata for a dynamically registered OIDC client (RFC 7591).
+// Dynamic clients are always public (PKCE-only; no client secret).
+type registeredClient struct {
+	ClientID     string
+	Domain       string
+	ClientName   string
+	RedirectURIs []string
+	RegisteredAt time.Time
+}
+
 // memStore is an in-memory store for auth codes and SSO sessions.
 // State is ephemeral — lost on process restart, which is acceptable for
 // a mail auth service where re-authentication is low-friction.
@@ -42,12 +52,14 @@ type memStore struct {
 	mu       sync.Mutex
 	codes    map[string]*authCode
 	sessions map[string]*ssoSession
+	clients  map[string]*registeredClient // key: "domain\x00clientID"
 }
 
 func newMemStore() *memStore {
 	return &memStore{
 		codes:    make(map[string]*authCode),
 		sessions: make(map[string]*ssoSession),
+		clients:  make(map[string]*registeredClient),
 	}
 }
 
@@ -100,6 +112,21 @@ func (s *memStore) DeleteSession(id string) {
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
+}
+
+// RegisterClient stores a dynamically registered OIDC client.
+func (s *memStore) RegisterClient(c *registeredClient) {
+	s.mu.Lock()
+	s.clients[c.Domain+"\x00"+c.ClientID] = c
+	s.mu.Unlock()
+}
+
+// LookupClient returns a dynamically registered client by domain and client ID.
+func (s *memStore) LookupClient(domain, clientID string) (*registeredClient, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.clients[domain+"\x00"+clientID]
+	return c, ok
 }
 
 // generateToken returns a cryptographically random base64url-encoded string of

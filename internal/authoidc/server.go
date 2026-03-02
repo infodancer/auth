@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -105,6 +106,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	mux.HandleFunc("POST /register", s.register)
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.discovery)
 	mux.HandleFunc("GET /.well-known/jwks.json", s.jwks)
 	mux.HandleFunc("GET /authorize", s.authorize)
@@ -158,13 +160,39 @@ func (s *Server) domainForHost(w http.ResponseWriter, r *http.Request) (*domainE
 }
 
 // clientFor finds a registered client by ID within a domain entry.
+// It checks static (config-file) clients first, then dynamically registered ones.
 func (s *Server) clientFor(de *domainEntry, clientID string) (*ClientConfig, bool) {
 	for i := range de.clients {
 		if de.clients[i].ID == clientID {
 			return &de.clients[i], true
 		}
 	}
+	if rc, ok := s.store.LookupClient(de.name, clientID); ok {
+		return &ClientConfig{
+			Domain:       rc.Domain,
+			ID:           rc.ClientID,
+			RedirectURIs: rc.RedirectURIs,
+			// Secret intentionally empty — dynamic clients are public (PKCE only).
+		}, true
+	}
 	return nil, false
+}
+
+// validateRedirectURIDomain returns an error if the host of rawURI is not equal
+// to or a subdomain of a registered domain. Used as defence-in-depth during
+// RFC 7591 dynamic client registration.
+func (s *Server) validateRedirectURIDomain(rawURI string) error {
+	u, err := url.Parse(rawURI)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid redirect_uri: %q", rawURI)
+	}
+	host := u.Hostname() // strips port
+	for domain := range s.domains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return nil
+		}
+	}
+	return fmt.Errorf("redirect_uri host %q is not on a registered domain", host)
 }
 
 // validRedirectURI reports whether uri is registered for the client.
